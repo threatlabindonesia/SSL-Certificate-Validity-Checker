@@ -29,7 +29,7 @@ This tool is ideal for security engineers, network administrators, and DevOps pr
 1. Clone the repository:
    ```bash
    git clone https://github.com/threatlabindonesia/SSL-Certificate-Validity-Checker.git
-   cd ssl-certificate-checker
+   cd SSL-Certificate-Validity-Checke
    ```
 
 2. Install the required Python packages:
