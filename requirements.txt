@@ -3,3 +3,4 @@ pandas
 tqdm
 pytz
 openpyxl
+cryptography
