@@ -4,15 +4,23 @@ import json
 import os
 import ssl
 import socket
+import subprocess
+import warnings
 from datetime import datetime, timezone
 import pytz
 import pandas as pd
 from tqdm import tqdm
 import logging
 from urllib.parse import urlparse
+from cryptography import x509
+from cryptography.hazmat.backends import default_backend
+from cryptography.utils import CryptographyDeprecationWarning
+
+# Suppress cryptography deprecation warnings
+warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
 
 # Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(filename="ssl_checker.log", level=logging.WARNING, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # Banner
 BANNER = """
@@ -47,158 +55,191 @@ def clean_domain(domain):
         return None
 
 # Function to get SSL certificate dates and status
-def get_ssl_dates(domain, timezone_code="UTC"):
+def get_ssl_dates(domain, port, timezone_code="UTC"):
     try:
         context = ssl.create_default_context()
         context.check_hostname = True
 
-        with socket.create_connection((domain, 443), timeout=10) as sock:
+        with socket.create_connection((domain, port), timeout=10) as sock:
             with context.wrap_socket(sock, server_hostname=domain) as ssl_sock:
                 cert = ssl_sock.getpeercert()
 
                 # Parse and determine the status
                 return parse_certificate_dates(cert, timezone_code)
 
-    except ssl.SSLError as ssl_error:
-        # Handle specific CERTIFICATE_VERIFY_FAILED errors gracefully
-        if "CERTIFICATE_VERIFY_FAILED" in str(ssl_error):
-            if "certificate has expired" in str(ssl_error):
-                logging.warning(f"SSL certificate verification failed for {domain}. Certificate has expired. Attempting manual extraction...")
-
-                try:
-                    # Retry with unverified context to extract the certificate
-                    context = ssl._create_unverified_context()
-                    context.check_hostname = False
-
-                    with socket.create_connection((domain, 443), timeout=10) as sock:
-                        with context.wrap_socket(sock, server_hostname=None) as ssl_sock:
-                            cert = ssl_sock.getpeercert()
-
-                            # Parse and determine the status (mark as expired with manual check note)
-                            result = parse_certificate_dates(cert, timezone_code)
-                            result["Status"] = "Expired [Manual check required due to verification failure]"
-                            return result
-
-                except Exception as retry_error:
-                    logging.error(f"Failed to retrieve certificate for {domain} after retry: {retry_error}")
-                    return {
-                        "Validity Start": "Unknown",
-                        "Validity End": "Unknown",
-                        "Days Expired": "N/A",
-                        "Status": "Expired [Manual check required due to verification failure]"
-                    }
-            else:
-                # Other CERTIFICATE_VERIFY_FAILED errors
-                logging.error(f"SSL verification error for {domain}: {ssl_error}")
-                return {
-                    "Validity Start": "Unknown",
-                    "Validity End": "Unknown",
-                    "Days Expired": "N/A",
-                    "Status": f"SSL Error: {ssl_error}"
-                }
     except Exception as e:
-        logging.error(f"Error retrieving SSL certificate for {domain}: {e}")
+        logging.warning(f"SSL module failed for {domain}:{port}: {e}")
+        # Fallback to OpenSSL
+        return get_certificate_with_openssl(domain, port)
+
+# Fallback to OpenSSL when Python's SSL module fails
+def get_certificate_with_openssl(target, port):
+    try:
+        command = [
+            "openssl", "s_client", "-connect", f"{target}:{port}", "-showcerts",
+            "-servername", target, "-verify_return_error"
+        ]
+        process = subprocess.run(
+            command,
+            input="QUIT\n",  # Send input to close the connection
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=15
+        )
+        output = process.stdout + process.stderr
+
+        # Extract the first PEM certificate
+        pem_cert = extract_pem_certificate(output)
+        if not pem_cert:
+            logging.error("Failed to extract PEM certificate from OpenSSL output.")
+            return {
+                "Validity Start": "Unknown",
+                "Validity End": "Unknown",
+                "Status": "OpenSSL failed to extract certificate",
+            }
+
+        # Parse the certificate and extract only the required fields
+        return parse_certificate(pem_cert)
+
+    except subprocess.TimeoutExpired:
+        logging.error(f"OpenSSL command timed out for {target}:{port}")
         return {
             "Validity Start": "Unknown",
             "Validity End": "Unknown",
-            "Days Expired": "N/A",
-            "Status": "Error"
+            "Status": "Timeout while retrieving certificate",
+        }
+    except Exception as e:
+        logging.error(f"Error retrieving certificate with OpenSSL: {e}")
+        return {
+            "Validity Start": "Unknown",
+            "Validity End": "Unknown",
+            "Status": "Error",
         }
 
-# Function to parse certificate dates and determine status
-def parse_certificate_dates(cert, timezone_code):
-    # Extract notBefore and notAfter dates
-    not_before = cert.get('notBefore', None)
-    not_after = cert.get('notAfter', None)
+def extract_pem_certificate(output):
+    """
+    Extract the first PEM-encoded certificate from the OpenSSL output.
+    """
+    start_marker = "-----BEGIN CERTIFICATE-----"
+    end_marker = "-----END CERTIFICATE-----"
+    start_index = output.find(start_marker)
+    end_index = output.find(end_marker, start_index)
 
-    # Parse dates if available
-    if not_before:
-        not_before_date = datetime.strptime(not_before, "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc)
-    else:
-        not_before_date = None
+    if start_index != -1 and end_index != -1:
+        return output[start_index:end_index + len(end_marker)]
+    return None
 
-    if not_after:
-        not_after_date = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc)
-    else:
-        not_after_date = None
+def parse_certificate(pem_cert):
+    """
+    Parse a PEM-encoded certificate and extract only CN, Validity Start, and Validity End.
+    """
+    try:
+        cert = x509.load_pem_x509_certificate(pem_cert.encode(), default_backend())
 
-    # Convert dates to specified timezone
+        # Extract CN (Common Name)
+        common_name = None
+        for attribute in cert.subject:
+            if attribute.oid == x509.NameOID.COMMON_NAME:
+                common_name = attribute.value
+                break
+
+        # Extract validity dates
+        not_before = cert.not_valid_before.strftime("%Y-%m-%d %H:%M:%S")
+        not_after = cert.not_valid_after.strftime("%Y-%m-%d %H:%M:%S")
+
+        return {
+            "Common Name (CN)": common_name,
+            "Validity Start": not_before,
+            "Validity End": not_after,
+            "Status": "Valid",
+        }
+    except Exception as e:
+        logging.error(f"Error parsing certificate: {e}")
+        return {
+            "Validity Start": "Unknown",
+            "Validity End": "Unknown",
+            "Status": "Parsing error",
+        }
+
+def adjust_timezone(results, timezone_code):
+    """
+    Adjusts Validity Start and End to the specified timezone and updates status based on expiry.
+    """
     tz = pytz.utc
     if timezone_code.upper() != "UTC":
         try:
             tz = pytz.timezone(pytz.country_timezones[timezone_code.upper()][0])
         except KeyError:
-            return {
-                "Validity Start": "Error: Invalid timezone code",
-                "Validity End": "Error: Invalid timezone code",
-                "Days Expired": "Unknown",
-                "Status": "Error"
-            }
+            logging.warning(f"Invalid timezone code: {timezone_code}. Defaulting to UTC.")
+            tz = pytz.utc
 
-    not_before_str = (
-        not_before_date.astimezone(tz).strftime("%A, %B %d, %Y at %I:%M:%S %p %Z")
-        if not_before_date else "Unknown"
-    )
-    not_after_str = (
-        not_after_date.astimezone(tz).strftime("%A, %B %d, %Y at %I:%M:%S %p %Z")
-        if not_after_date else "Unknown"
-    )
+    for result in results:
+        try:
+            if result["Validity Start"] != "Unknown" and result["Validity End"] != "Unknown":
+                # Convert dates
+                validity_start = datetime.strptime(result["Validity Start"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                validity_end = datetime.strptime(result["Validity End"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
 
-    # Determine status based on the expiry date and calculate days expired if applicable
-    days_expired = None
-    if not_after_date:
-        now = datetime.now(timezone.utc).astimezone(tz)
-        delta = not_after_date - now
+                result["Validity Start"] = validity_start.astimezone(tz).strftime("%A, %B %d, %Y at %I:%M:%S %p %Z")
+                result["Validity End"] = validity_end.astimezone(tz).strftime("%A, %B %d, %Y at %I:%M:%S %p %Z")
 
-        if delta.days > 90:
-            status = "Valid"
-        elif 30 < delta.days <= 90:
-            status = "Almost Expired"
-        elif 0 < delta.days <= 30:
-            status = "Expiring Soon"
-        else:
-            status = "Expired"
-            days_expired = abs(delta.days)  # Calculate how many days it has been expired
-    else:
-        status = "Unknown"
-
-    return {
-        "Validity Start": not_before_str,
-        "Validity End": not_after_str,
-        "Days Expired": days_expired if days_expired is not None else "N/A",
-        "Status": status
-    }
+                # Check expiration status
+                now = datetime.now(tz)
+                if validity_end < now:
+                    result["Status"] = "Expired"
+                elif (validity_end - now).days <= 30:
+                    result["Status"] = "Expiring Soon"
+                elif (validity_end - now).days <= 90:
+                    result["Status"] = "Almost Expired"
+                else:
+                    result["Status"] = "Valid"
+        except Exception as e:
+            # Log errors but do not stop processing
+            logging.error(f"Error adjusting timezone or updating status: {e}")
+    return results
 
 # Process domains
-def process_domains(domains, timezone_code="UTC"):
+def process_domains(domains, port, timezone_code="UTC"):
     results = []
-    for domain in tqdm(domains, desc="Processing domains", ncols=80):
-        clean_dom = clean_domain(domain)
-        if not clean_dom:
-            results.append({
-                "Domain": domain,
-                "Validity Start": "Error: Invalid domain format",
-                "Validity End": "Error: Invalid domain format",
-                "Days Expired": "Unknown",
-                "Status": "Unknown"
-            })
-            continue
+    total_domains = len(domains)
 
-        domain_result = {"Domain": domain}
+    with tqdm(total=total_domains, desc="Calculating total domains checked", ncols=100, unit="domain") as pbar:
+        for domain in domains:
+            clean_dom = clean_domain(domain)
+            if not clean_dom:
+                results.append({
+                    "Domain": domain,
+                    "Validity Start": "Error: Invalid domain format",
+                    "Validity End": "Error: Invalid domain format",
+                    "Status": "Unknown"
+                })
+                pbar.update(1)
+                continue
 
-        if not is_resolvable(clean_dom):
-            domain_result.update({
-                "Validity Start": "Error: Domain not resolvable",
-                "Validity End": "Error: Domain not resolvable",
-                "Days Expired": "Unknown",
-                "Status": "Unknown"
-            })
-        else:
-            cert_details = get_ssl_dates(clean_dom, timezone_code)
-            domain_result.update(cert_details)
+            domain_result = {"Domain": domain}
 
-        results.append(domain_result)
-    return results
+            if not is_resolvable(clean_dom):
+                domain_result.update({
+                    "Validity Start": "Error: Domain not resolvable",
+                    "Validity End": "Error: Domain not resolvable",
+                    "Status": "Unknown"
+                })
+            else:
+                try:
+                    cert_details = get_ssl_dates(clean_dom, port, timezone_code)
+                    domain_result.update(cert_details)
+                except Exception as e:
+                    logging.error(f"Error processing domain {domain}: {e}")
+                    domain_result.update({
+                        "Validity Start": "Unknown",
+                        "Validity End": "Unknown",
+                        "Status": "Error"
+                    })
+
+            results.append(domain_result)
+            pbar.update(1)
+    return adjust_timezone(results, timezone_code)
 
 # Save or display results
 def save_results(results, output_format, output_path):
@@ -232,6 +273,7 @@ def main():
     parser.add_argument("--output", type=str, help="Output file path")
     parser.add_argument("--format", type=str, choices=["json", "csv", "xlsx", "txt"], default="json", help="Output file format (default: json)")
     parser.add_argument("--time", type=str, default="UTC", help="Timezone code (e.g., ID for Indonesia, KE for Kenya, default: UTC)")
+    parser.add_argument("--port", type=int, default=443, help="Port to check (default: 443)")
     args = parser.parse_args()
 
     domains = []
@@ -248,7 +290,7 @@ def main():
         print("Error: Please specify a domain or file.")
         return
 
-    results = process_domains(domains, timezone_code=args.time)
+    results = process_domains(domains, args.port, timezone_code=args.time)
     save_results(results, args.format, args.output)
 
 if __name__ == "__main__":
