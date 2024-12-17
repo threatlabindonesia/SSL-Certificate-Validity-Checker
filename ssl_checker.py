@@ -188,7 +188,7 @@ def adjust_timezone(results, timezone_code):
                 now = datetime.now(tz)
                 if validity_end < now:
                     result["Status"] = "Expired"
-                elif (validity_end - now).days <= 30:
+                elif (validity_end - now).days <= 14:
                     result["Status"] = "Expiring Soon"
                 elif (validity_end - now).days <= 90:
                     result["Status"] = "Almost Expired"
@@ -200,13 +200,32 @@ def adjust_timezone(results, timezone_code):
     return results
 
 # Process domains
-def process_domains(domains, port, timezone_code="UTC"):
+# Process domains
+def process_domains(domains, default_port, timezone_code="UTC"):
     results = []
     total_domains = len(domains)
 
     with tqdm(total=total_domains, desc="Calculating total domains checked", ncols=100, unit="domain") as pbar:
         for domain in domains:
             clean_dom = clean_domain(domain)
+            current_port = default_port
+
+            # Detect if domain contains a port (e.g., domain:port)
+            if ":" in domain:
+                try:
+                    clean_dom, custom_port = domain.rsplit(":", 1)
+                    current_port = int(custom_port)  # Set custom port
+                except ValueError:
+                    logging.warning(f"Invalid port format for domain: {domain}")
+                    results.append({
+                        "Domain": domain,
+                        "Validity Start": "Error: Invalid port format",
+                        "Validity End": "Error: Invalid port format",
+                        "Status": "Error"
+                    })
+                    pbar.update(1)
+                    continue
+
             if not clean_dom:
                 results.append({
                     "Domain": domain,
@@ -227,7 +246,7 @@ def process_domains(domains, port, timezone_code="UTC"):
                 })
             else:
                 try:
-                    cert_details = get_ssl_dates(clean_dom, port, timezone_code)
+                    cert_details = get_ssl_dates(clean_dom, current_port, timezone_code)
                     domain_result.update(cert_details)
                 except Exception as e:
                     logging.error(f"Error processing domain {domain}: {e}")
